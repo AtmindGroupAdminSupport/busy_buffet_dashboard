@@ -67,15 +67,22 @@ def build_date_axis(daily: pd.DataFrame) -> dict:
 def build_count_marker_style(counts: pd.Series, color: str, symbol: str = "circle") -> dict:
     positive_counts = pd.to_numeric(counts, errors="coerce").fillna(0)
     max_count = float(positive_counts.max()) if not positive_counts.empty else 0.0
-    sizeref = max(max_count / (26**2), 1 / (26**2))
-    sizes = positive_counts.clip(lower=1).tolist()
+    min_count = float(positive_counts.min()) if not positive_counts.empty else 0.0
+
+    if max_count > min_count:
+        normalized_counts = (positive_counts - min_count) / (max_count - min_count)
+    else:
+        normalized_counts = pd.Series(1.0 if max_count > 0 else 0.0, index=positive_counts.index, dtype="float64")
+
+    marker_colors = [
+        hex_to_rgba(color, 0.35 + (0.6 * float(intensity)))
+        for intensity in normalized_counts
+    ]
     return {
-        "size": sizes,
-        "sizemode": "area",
-        "sizeref": sizeref,
-        "sizemin": 8,
-        "color": color,
+        "size": 12,
+        "color": marker_colors,
         "symbol": symbol,
+        "line": {"width": 0},
     }
 
 
@@ -419,13 +426,9 @@ def build_queue_with_walkaway_area_chart(daily: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     nonzero_walkaways = daily["walk_aways"] > 0
     queue_point_mask = daily["waited_groups"].notna() & daily["has_sheet_data"].fillna(False)
-    guest_point_mask = daily["guest_count"].notna() & daily["has_sheet_data"].fillna(False)
     walkaway_labels = daily["walk_aways"].apply(lambda value: f"WA: {int(value)}" if value > 0 else "")
-    guest_count_labels = daily["guest_count"].apply(lambda value: str(int(value)) if pd.notna(value) else "")
     queue_line = mask_series_for_missing_days(daily["waited_groups"], daily["has_sheet_data"])
-    guest_count_line = mask_series_for_missing_days(daily["guest_count"], daily["has_sheet_data"])
     queue_gap_pairs = find_missing_day_gap_pairs(daily["waited_groups"], daily["has_sheet_data"])
-    guest_gap_pairs = find_missing_day_gap_pairs(daily["guest_count"], daily["has_sheet_data"])
     bar_colors = [
         hex_to_rgba(PALETTE["coral"], 0.78) if walkaways > 0 else hex_to_rgba(PALETTE["berry"], 0.22)
         for walkaways in daily["walk_aways"]
@@ -471,39 +474,6 @@ def build_queue_with_walkaway_area_chart(daily: pd.DataFrame) -> go.Figure:
             showlegend=False,
         )
     fig.add_scatter(
-        x=daily["date_label"],
-        y=guest_count_line,
-        name="Guest count",
-        mode="lines",
-        yaxis="y2",
-        line=dict(color=hex_to_rgba(PALETTE["coral"], 0.55), width=2),
-        hovertemplate="Date: %{x}<br>Guest count: %{y}<extra></extra>",
-        legendrank=3,
-    )
-    fig.add_scatter(
-        x=daily.loc[guest_point_mask, "date_label"],
-        y=daily.loc[guest_point_mask, "guest_count"],
-        name="Guest count labels",
-        mode="markers+text",
-        text=guest_count_labels[guest_point_mask],
-        textposition="top center",
-        yaxis="y2",
-        marker=dict(size=8, color=hex_to_rgba(PALETTE["coral"], 0.55), symbol="circle"),
-        hovertemplate="Date: %{x}<br>Guest count: %{y}<extra></extra>",
-        showlegend=False,
-    )
-    if guest_gap_pairs:
-        fig.add_scatter(
-            x=[item for start, end in guest_gap_pairs for item in (daily.iloc[start]["date_label"], daily.iloc[end]["date_label"], None)],
-            y=[item for start, end in guest_gap_pairs for item in (daily.iloc[start]["guest_count"], daily.iloc[end]["guest_count"], None)],
-            name="Guest count gap",
-            mode="lines",
-            yaxis="y2",
-            line=dict(color=hex_to_rgba(PALETTE["coral"], 0.55), width=2, dash="dot"),
-            hoverinfo="skip",
-            showlegend=False,
-        )
-    fig.add_scatter(
         x=daily.loc[queue_point_mask, "date_label"],
         y=daily.loc[queue_point_mask, "waited_groups"],
         name="Number of queues markers",
@@ -530,7 +500,7 @@ def build_queue_with_walkaway_area_chart(daily: pd.DataFrame) -> go.Figure:
         showlegend=False,
     )
     fig.update_layout(
-        title="Queues plus walk-aways area by date",
+        title="Queue pressure and walk-aways by date",
         xaxis=build_date_axis(daily),
         yaxis=dict(title="Average wait (minutes)", rangemode="tozero", ticks="outside"),
         yaxis2=dict(
@@ -542,6 +512,42 @@ def build_queue_with_walkaway_area_chart(daily: pd.DataFrame) -> go.Figure:
             showgrid=False,
             ticks="outside",
         ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hovermode="x unified",
+        template="plotly_white",
+    )
+    return fig
+
+
+def build_guest_count_and_queue_chart(daily: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_bar(
+        x=daily["date_label"],
+        y=daily["guest_count"],
+        name="Guest count",
+        marker_color=hex_to_rgba(PALETTE["coral"], 0.82),
+        customdata=daily[["waited_groups"]],
+        hovertemplate=(
+            "Date: %{x}<br>Guest count: %{y}"
+            "<br>Number of queues: %{customdata[0]}<extra></extra>"
+        ),
+    )
+    fig.add_bar(
+        x=daily["date_label"],
+        y=daily["waited_groups"],
+        name="Number of queues",
+        marker_color=hex_to_rgba(PALETTE["berry"], 0.82),
+        customdata=daily[["guest_count"]],
+        hovertemplate=(
+            "Date: %{x}<br>Number of queues: %{y}"
+            "<br>Guest count: %{customdata[0]}<extra></extra>"
+        ),
+    )
+    fig.update_layout(
+        title="Guest count and number of queues by date",
+        xaxis=build_date_axis(daily),
+        yaxis=dict(title="Count", rangemode="tozero", ticks="outside"),
+        barmode="stack",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         hovermode="x unified",
         template="plotly_white",
@@ -755,6 +761,7 @@ def main() -> None:
 
     with overview_tab:
         render_plotly_chart(build_queue_with_walkaway_area_chart(daily))
+        render_plotly_chart(build_guest_count_and_queue_chart(daily))
         st.markdown("*WA = walk away | Time on bar is peak of queue waiting*")
 
         peak_wait_row = daily.loc[daily["avg_wait_minutes"].idxmax()]
