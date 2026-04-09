@@ -26,6 +26,8 @@ PALETTE = {
     "sand": "#E7D8A1",
 }
 QUEUING_AREA_TABLE = "99"
+DAILY_ANALYTICS_START_TIME = datetime.time(6, 0)
+DAILY_ANALYTICS_END_TIME = datetime.time(12, 0)
 
 
 def get_secret_value(key: str) -> str | None:
@@ -48,6 +50,24 @@ def hex_to_rgba(hex_color: str, alpha: float) -> str:
     green = int(hex_color[2:4], 16)
     blue = int(hex_color[4:6], 16)
     return f"rgba({red}, {green}, {blue}, {alpha})"
+
+
+def clip_to_daily_analytics_window(
+    start_value: pd.Timestamp | datetime.datetime,
+    end_value: pd.Timestamp | datetime.datetime,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    start_timestamp = pd.Timestamp(start_value)
+    end_timestamp = pd.Timestamp(end_value)
+    if pd.isna(start_timestamp) or pd.isna(end_timestamp) or end_timestamp <= start_timestamp:
+        return None
+
+    window_start = pd.Timestamp.combine(start_timestamp.date(), DAILY_ANALYTICS_START_TIME)
+    window_end = pd.Timestamp.combine(start_timestamp.date(), DAILY_ANALYTICS_END_TIME)
+    clipped_start = max(start_timestamp, window_start)
+    clipped_end = min(end_timestamp, window_end)
+    if clipped_end <= clipped_start:
+        return None
+    return clipped_start, clipped_end
 
 
 def build_date_axis(daily: pd.DataFrame) -> dict:
@@ -565,30 +585,63 @@ def build_guest_count_and_queue_chart(daily: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     fig.add_bar(
         x=daily["date_label"],
-        y=daily["guest_count"],
-        name="Guest count",
-        marker_color=hex_to_rgba(PALETTE["coral"], 0.82),
-        customdata=daily[["waited_groups"]],
+        y=daily["walk_in_pax"],
+        name="Walk in (pax)",
+        marker_color=hex_to_rgba(PALETTE["amber"], 0.82),
+        customdata=daily[["in_house_pax", "waited_groups"]],
         hovertemplate=(
-            "Date: %{x}<br>Guest count: %{y}"
-            "<br>Number of queues: %{customdata[0]}<extra></extra>"
+            "Date: %{x}<br>Walk in (pax): %{y}"
+            "<br>In house (pax): %{customdata[0]}"
+            "<br>Number of queues: %{customdata[1]}<extra></extra>"
         ),
     )
     fig.add_bar(
         x=daily["date_label"],
-        y=daily["waited_groups"],
+        y=daily["in_house_pax"],
+        name="In house (pax)",
+        marker_color=hex_to_rgba(PALETTE["coral"], 0.82),
+        customdata=daily[["walk_in_pax", "waited_groups"]],
+        hovertemplate=(
+            "Date: %{x}<br>In house (pax): %{y}"
+            "<br>Walk in (pax): %{customdata[0]}"
+            "<br>Number of queues: %{customdata[1]}<extra></extra>"
+        ),
+    )
+    nonzero_queue_mask = daily["waited_groups"] > 0
+    fig.add_scatter(
+        x=daily.loc[nonzero_queue_mask, "date_label"],
+        y=daily.loc[nonzero_queue_mask, "waited_groups"],
         name="Number of queues",
-        marker_color=hex_to_rgba(PALETTE["berry"], 0.82),
-        customdata=daily[["guest_count"]],
+        yaxis="y2",
+        mode="markers",
+        marker=dict(
+            size=10,
+            color=daily.loc[nonzero_queue_mask, "avg_wait_minutes"],
+            colorscale=[[0, hex_to_rgba(PALETTE["berry"], 0.45)], [1, PALETTE["berry"]]],
+            showscale=False,
+            line=dict(width=0),
+        ),
+        customdata=daily.loc[nonzero_queue_mask, ["walk_in_pax", "in_house_pax", "avg_wait_minutes"]],
         hovertemplate=(
             "Date: %{x}<br>Number of queues: %{y}"
-            "<br>Guest count: %{customdata[0]}<extra></extra>"
+            "<br>Average wait (min): %{customdata[2]:.1f}"
+            "<br>Walk in (pax): %{customdata[0]}"
+            "<br>In house (pax): %{customdata[1]}<extra></extra>"
         ),
     )
     fig.update_layout(
-        title="Guest count and number of queues by date",
+        title="Guest pax split and number of queues by date",
         xaxis=build_date_axis(daily),
         yaxis=dict(title="Count", rangemode="tozero", ticks="outside"),
+        yaxis2=dict(
+            title="Number of queues",
+            overlaying="y",
+            side="right",
+            rangemode="tozero",
+            showline=False,
+            showgrid=False,
+            ticks="outside",
+        ),
         barmode="stack",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         hovermode="x unified",
@@ -602,17 +655,21 @@ def build_daily_seating_gantt(day_df: pd.DataFrame) -> go.Figure:
     for row in day_df.itertuples(index=False):
         if pd.isna(row.meal_start) or pd.isna(row.meal_end):
             continue
+        clipped_meal_window = clip_to_daily_analytics_window(row.meal_start, row.meal_end)
+        if clipped_meal_window is None:
+            continue
+        clipped_meal_start, clipped_meal_end = clipped_meal_window
         for table in expand_table_no(row.table_no):
             if table == QUEUING_AREA_TABLE:
                 continue
             seating_rows.append(
                 {
                     "table_no": table,
-                    "meal_start": row.meal_start,
-                    "meal_end": row.meal_end,
+                    "meal_start": clipped_meal_start,
+                    "meal_end": clipped_meal_end,
                     "guest_type": row.guest_type if getattr(row, "guest_type", "") else "Unknown",
                     "service_no": getattr(row, "service_no", ""),
-                    "duration_minutes": max(0.0, (row.meal_end - row.meal_start).total_seconds() / 60),
+                    "duration_minutes": max(0.0, (clipped_meal_end - clipped_meal_start).total_seconds() / 60),
                 }
             )
 
@@ -653,15 +710,19 @@ def build_daily_seating_gantt(day_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def build_daily_load_chart(day_df: pd.DataFrame) -> go.Figure:
+def build_daily_load_profile(day_df: pd.DataFrame, *, time_bin_frequency: str = "5min") -> pd.DataFrame:
     occupancy_slices: list[pd.DataFrame] = []
     for row in day_df.itertuples(index=False):
         if pd.isna(row.meal_start) or pd.isna(row.meal_end):
             continue
+        clipped_meal_window = clip_to_daily_analytics_window(row.meal_start, row.meal_end)
+        if clipped_meal_window is None:
+            continue
+        clipped_meal_start, clipped_meal_end = clipped_meal_window
         time_index = pd.date_range(
-            start=row.meal_start.floor("min"),
-            end=row.meal_end.ceil("min"),
-            freq="1min",
+            start=clipped_meal_start.floor(time_bin_frequency),
+            end=clipped_meal_end.ceil(time_bin_frequency),
+            freq=time_bin_frequency,
             inclusive="left",
         )
         if len(time_index) == 0:
@@ -673,10 +734,14 @@ def build_daily_load_chart(day_df: pd.DataFrame) -> go.Figure:
 
     queue_slices: list[pd.DataFrame] = []
     for row in day_df[day_df["queue_start"].notna() & day_df["queue_end"].notna()].itertuples(index=False):
+        clipped_queue_window = clip_to_daily_analytics_window(row.queue_start, row.queue_end)
+        if clipped_queue_window is None:
+            continue
+        clipped_queue_start, clipped_queue_end = clipped_queue_window
         time_index = pd.date_range(
-            start=row.queue_start.floor("min"),
-            end=row.queue_end.ceil("min"),
-            freq="1min",
+            start=clipped_queue_start.floor(time_bin_frequency),
+            end=clipped_queue_end.ceil(time_bin_frequency),
+            freq=time_bin_frequency,
             inclusive="left",
         )
         if len(time_index) == 0:
@@ -694,16 +759,88 @@ def build_daily_load_chart(day_df: pd.DataFrame) -> go.Figure:
         else pd.DataFrame(columns=["time", "queue"])
     )
     if seated.empty and queued.empty:
-        return go.Figure()
+        return pd.DataFrame(columns=["time", "seated", "queue", "time_label"])
 
     start_time = min(frame["time"].min() for frame in [seated, queued] if not frame.empty)
     end_time = max(frame["time"].max() for frame in [seated, queued] if not frame.empty)
-    load = pd.DataFrame({"time": pd.date_range(start_time, end_time, freq="1min")})
+    load = pd.DataFrame({"time": pd.date_range(start_time, end_time, freq=time_bin_frequency)})
     load = load.merge(seated, on="time", how="left").merge(queued, on="time", how="left").fillna(0)
+    load["time_label"] = load["time"].dt.strftime("%H:%M")
+    return load
+
+
+def build_average_daily_load_profile(comparison_day_df: pd.DataFrame, *, time_bin_frequency: str = "5min") -> pd.DataFrame:
+    if comparison_day_df.empty:
+        return pd.DataFrame(columns=["time_label", "seated", "queue"])
+
+    daily_profiles: list[pd.DataFrame] = []
+    for comparison_date in sorted(comparison_day_df["date"].dropna().dt.normalize().unique()):
+        profile = build_daily_load_profile(
+            comparison_day_df[comparison_day_df["date"] == comparison_date].copy(),
+            time_bin_frequency=time_bin_frequency,
+        )
+        if profile.empty:
+            continue
+        daily_profiles.append(profile[["time_label", "seated", "queue"]])
+
+    if not daily_profiles:
+        return pd.DataFrame(columns=["time_label", "seated", "queue"])
+
+    combined = pd.concat(daily_profiles, ignore_index=True)
+    averaged = combined.groupby("time_label", as_index=False)[["seated", "queue"]].mean()
+    return averaged.sort_values("time_label")
+
+
+def build_daily_load_chart(day_df: pd.DataFrame, comparison_day_df: pd.DataFrame | None = None) -> go.Figure:
+    load = build_daily_load_profile(day_df)
+    if load.empty:
+        return go.Figure()
+
+    comparison_load = build_average_daily_load_profile(comparison_day_df.copy()) if comparison_day_df is not None else pd.DataFrame()
 
     fig = go.Figure()
-    fig.add_bar(x=load["time"], y=load["seated"], name="Seated tables", marker_color=PALETTE["orange"])
-    fig.add_bar(x=load["time"], y=load["queue"], name="Waiting groups", marker_color=PALETTE["berry"])
+    if not comparison_load.empty:
+        fig.add_scatter(
+            x=comparison_load["time_label"],
+            y=comparison_load["seated"],
+            name="Average seated tables",
+            mode="lines",
+            line=dict(color=hex_to_rgba(PALETTE["orange"], 0.3), width=0),
+            fill="tozeroy",
+            fillcolor=hex_to_rgba(PALETTE["orange"], 0.14),
+            hovertemplate="Time: %{x}<br>Average seated tables: %{y:.1f}<extra></extra>",
+        )
+        fig.add_scatter(
+            x=comparison_load["time_label"],
+            y=comparison_load["seated"],
+            name="Average seated tables outline",
+            mode="lines",
+            line=dict(color=hex_to_rgba(PALETTE["orange"], 0.55), width=2, dash="dot"),
+            hovertemplate="Time: %{x}<br>Average seated tables: %{y:.1f}<extra></extra>",
+            showlegend=False,
+        )
+        fig.add_scatter(
+            x=comparison_load["time_label"],
+            y=comparison_load["queue"],
+            name="Average waiting groups",
+            mode="lines",
+            line=dict(color=hex_to_rgba(PALETTE["berry"], 0.3), width=0),
+            fill="tozeroy",
+            fillcolor=hex_to_rgba(PALETTE["berry"], 0.12),
+            hovertemplate="Time: %{x}<br>Average waiting groups: %{y:.1f}<extra></extra>",
+        )
+        fig.add_scatter(
+            x=comparison_load["time_label"],
+            y=comparison_load["queue"],
+            name="Average waiting groups outline",
+            mode="lines",
+            line=dict(color=hex_to_rgba(PALETTE["berry"], 0.6), width=2, dash="dot"),
+            hovertemplate="Time: %{x}<br>Average waiting groups: %{y:.1f}<extra></extra>",
+            showlegend=False,
+        )
+
+    fig.add_bar(x=load["time_label"], y=load["seated"], name="Seated tables", marker_color=PALETTE["orange"])
+    fig.add_bar(x=load["time_label"], y=load["queue"], name="Waiting groups", marker_color=PALETTE["berry"])
     fig.update_layout(
         title="Stacked seated and waiting load by time of day",
         xaxis_title="Time",
@@ -715,15 +852,19 @@ def build_daily_load_chart(day_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def build_daily_occupancy_chart(day_df: pd.DataFrame) -> go.Figure:
+def build_daily_occupancy_profile(day_df: pd.DataFrame, *, time_bin_frequency: str = "5min") -> pd.DataFrame:
     occupancy_slices: list[pd.DataFrame] = []
     for row in day_df.itertuples(index=False):
         if pd.isna(row.meal_start) or pd.isna(row.meal_end):
             continue
+        clipped_meal_window = clip_to_daily_analytics_window(row.meal_start, row.meal_end)
+        if clipped_meal_window is None:
+            continue
+        clipped_meal_start, clipped_meal_end = clipped_meal_window
         time_index = pd.date_range(
-            start=row.meal_start.floor("min"),
-            end=row.meal_end.ceil("min"),
-            freq="1min",
+            start=clipped_meal_start.floor(time_bin_frequency),
+            end=clipped_meal_end.ceil(time_bin_frequency),
+            freq=time_bin_frequency,
             inclusive="left",
         )
         if len(time_index) == 0:
@@ -742,7 +883,7 @@ def build_daily_occupancy_chart(day_df: pd.DataFrame) -> go.Figure:
             )
 
     if not occupancy_slices:
-        return go.Figure()
+        return pd.DataFrame(columns=["time", "table_no", "guest_type", "tables_occupied", "time_label"])
 
     occupancy_df = pd.concat(occupancy_slices)
     occupancy_by_guest_type = (
@@ -750,21 +891,100 @@ def build_daily_occupancy_chart(day_df: pd.DataFrame) -> go.Figure:
         .nunique()
         .reset_index(name="tables_occupied")
     )
-    fig = px.bar(
-        occupancy_by_guest_type,
-        x="time",
-        y="tables_occupied",
-        color="guest_type",
-        barmode="stack",
-        color_discrete_map={"In house": PALETTE["coral"], "Walk in": PALETTE["amber"], "Unknown": PALETTE["sand"]},
-        labels={
-            "time": "Time",
-            "tables_occupied": "Tables occupied",
-            "guest_type": "Guest type",
-        },
-        title="Table occupancy by time of day",
+    occupancy_by_guest_type["time_label"] = occupancy_by_guest_type["time"].dt.strftime("%H:%M")
+    return occupancy_by_guest_type
+
+
+def build_average_daily_occupancy_profile(
+    comparison_day_df: pd.DataFrame,
+    *,
+    time_bin_frequency: str = "5min",
+) -> pd.DataFrame:
+    if comparison_day_df.empty:
+        return pd.DataFrame(columns=["time_label", "guest_type", "tables_occupied"])
+
+    daily_profiles: list[pd.DataFrame] = []
+    for comparison_date in sorted(comparison_day_df["date"].dropna().dt.normalize().unique()):
+        profile = build_daily_occupancy_profile(
+            comparison_day_df[comparison_day_df["date"] == comparison_date].copy(),
+            time_bin_frequency=time_bin_frequency,
+        )
+        if profile.empty:
+            continue
+        daily_profiles.append(profile[["time_label", "guest_type", "tables_occupied"]])
+
+    if not daily_profiles:
+        return pd.DataFrame(columns=["time_label", "guest_type", "tables_occupied"])
+
+    combined = pd.concat(daily_profiles, ignore_index=True)
+    averaged = combined.groupby(["time_label", "guest_type"], as_index=False)["tables_occupied"].mean()
+    return averaged.sort_values(["time_label", "guest_type"])
+
+
+def build_daily_occupancy_chart(day_df: pd.DataFrame, comparison_day_df: pd.DataFrame | None = None) -> go.Figure:
+    occupancy_by_guest_type = build_daily_occupancy_profile(day_df)
+    if occupancy_by_guest_type.empty:
+        return go.Figure()
+
+    comparison_occupancy = (
+        build_average_daily_occupancy_profile(comparison_day_df.copy())
+        if comparison_day_df is not None
+        else pd.DataFrame()
     )
+    fig = go.Figure()
+    color_discrete_map = {"In house": PALETTE["coral"], "Walk in": PALETTE["amber"], "Unknown": PALETTE["sand"]}
+    guest_type_order = ["In house", "Walk in", "Unknown"]
+
+    if not comparison_occupancy.empty:
+        for guest_type in guest_type_order:
+            series = comparison_occupancy[comparison_occupancy["guest_type"] == guest_type]
+            if series.empty:
+                continue
+            fig.add_scatter(
+                x=series["time_label"],
+                y=series["tables_occupied"],
+                name=f"Average {guest_type}",
+                mode="lines",
+                line=dict(color=hex_to_rgba(color_discrete_map[guest_type], 0.3), width=0),
+                fill="tozeroy",
+                fillcolor=hex_to_rgba(color_discrete_map[guest_type], 0.12),
+                hovertemplate=(
+                    f"Time: %{{x}}<br>Average {guest_type} tables: %{{y:.1f}}<extra></extra>"
+                ),
+            )
+            fig.add_scatter(
+                x=series["time_label"],
+                y=series["tables_occupied"],
+                name=f"Average {guest_type} outline",
+                mode="lines",
+                line=dict(color=hex_to_rgba(color_discrete_map[guest_type], 0.6), width=2, dash="dot"),
+                hovertemplate=(
+                    f"Time: %{{x}}<br>Average {guest_type} tables: %{{y:.1f}}<extra></extra>"
+                ),
+                showlegend=False,
+            )
+
+    for guest_type in guest_type_order:
+        series = occupancy_by_guest_type[occupancy_by_guest_type["guest_type"] == guest_type]
+        if series.empty:
+            continue
+        fig.add_bar(
+            x=series["time_label"],
+            y=series["tables_occupied"],
+            name=guest_type,
+            marker_color=color_discrete_map[guest_type],
+            hovertemplate=(
+                f"Time: %{{x}}<br>{guest_type} tables: %{{y}}<extra></extra>"
+            ),
+        )
+
     fig.update_layout(template="plotly_white", hovermode="x unified")
+    fig.update_layout(
+        title="Table occupancy by time of day",
+        xaxis_title="Time",
+        yaxis_title="Tables occupied",
+        barmode="stack",
+    )
     return fig
 
 
@@ -870,16 +1090,44 @@ def main() -> None:
             st.info("No daily records are available for detailed analytics.")
             return
 
-        selected_date = st.selectbox(
+        selector_left, selector_right = st.columns(2)
+        selected_date = selector_left.selectbox(
             "Choose a day",
             options=available_dates,
             index=len(available_dates) - 1,
             format_func=lambda value: pd.Timestamp(value).strftime("%Y-%m-%d"),
+            key="daily_selected_date",
+        )
+        selected_day = pd.Timestamp(selected_date).normalize()
+        default_comparison_mode = "weekend (average)" if selected_day.dayofweek >= 5 else "weekday (average)"
+        if (
+            st.session_state.get("daily_compare_anchor_date") != selected_day
+            or "daily_comparison_mode" not in st.session_state
+        ):
+            st.session_state["daily_comparison_mode"] = default_comparison_mode
+            st.session_state["daily_compare_anchor_date"] = selected_day
+        comparison_mode = selector_right.selectbox(
+            "Choose compare",
+            options=[
+                "weekday (average)",
+                "weekend (average)",
+                "same day of week (average)",
+            ],
+            key="daily_comparison_mode",
         )
         day_df = df[df["date"] == pd.Timestamp(selected_date).normalize()].copy()
-        selected_day = pd.Timestamp(selected_date).normalize()
         selected_day_summary = daily.loc[daily["date"] == selected_day].iloc[0]
-        comparison_daily = daily[daily["has_sheet_data"] & (daily["day_type"] == selected_day_summary["day_type"])].copy()
+
+        if comparison_mode == "weekday (average)":
+            comparison_daily = daily[daily["has_sheet_data"] & daily["date"].dt.dayofweek.lt(5)].copy()
+            comparison_label = "weekday"
+        elif comparison_mode == "weekend (average)":
+            comparison_daily = daily[daily["has_sheet_data"] & daily["date"].dt.dayofweek.ge(5)].copy()
+            comparison_label = "weekend"
+        else:
+            selected_weekday = int(selected_day.dayofweek)
+            comparison_daily = daily[daily["has_sheet_data"] & daily["date"].dt.dayofweek.eq(selected_weekday)].copy()
+            comparison_label = selected_day.day_name().lower()
 
         average_group_count = comparison_daily["group_count"].mean() if not comparison_daily.empty else 0.0
         average_guest_count = comparison_daily["guest_count"].mean() if not comparison_daily.empty else 0.0
@@ -985,10 +1233,9 @@ def main() -> None:
 
         st.caption(f"{selected_day_summary['date_label']} metrics.")
         st.markdown(
-            f"Comparison deltas are versus the average <u><strong>{str(selected_day_summary['day_type']).lower()}</strong></u>.",
+            f"Comparison deltas are versus the average <u><strong>{comparison_label}</strong></u>.",
             unsafe_allow_html=True,
         )
-        comparison_label = str(selected_day_summary["day_type"]).lower()
 
         top_metric_group, top_metric_pax, top_metric_walk_in, top_metric_in_house = st.columns(4)
         top_metric_group.metric(
@@ -1087,13 +1334,13 @@ def main() -> None:
         else:
             st.info("No seating duration data is available for this day.")
 
-        load_chart = build_daily_load_chart(day_df)
+        load_chart = build_daily_load_chart(day_df, comparison_day_df)
         if load_chart.data:
             render_plotly_chart(load_chart)
         else:
             st.info("No seated or queue data is available for this day.")
 
-        occupancy_chart = build_daily_occupancy_chart(day_df)
+        occupancy_chart = build_daily_occupancy_chart(day_df, comparison_day_df)
         if occupancy_chart.data:
             render_plotly_chart(occupancy_chart)
         else:
