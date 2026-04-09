@@ -122,9 +122,10 @@ def build_workbook_export_url(spreadsheet_url: str) -> str:
 
 def parse_sheet_date(sheet_name: str, default_year: int | None = None) -> pd.Timestamp | None:
     name = str(sheet_name).strip()
-    if len(name) >= 3 and name[:3].isdigit():
-        day = int(name[:2])
-        month = int(name[2])
+    if name.isdigit() and len(name) >= 2:
+        # Tabs are named as day+month without separators (e.g. 133 -> 13/3, 14 -> 1/4).
+        day = int(name[:-1])
+        month = int(name[-1])
         if 1 <= day <= 31 and 1 <= month <= 12:
             year = default_year or pd.Timestamp.now().year
             return pd.Timestamp(year, month, day).normalize()
@@ -173,7 +174,7 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
     else:
-        df["date"] = pd.Timestamp.now().normalize()
+        df["date"] = pd.NaT
 
     for column in ["table_no", "guest_type"]:
         if column in df.columns:
@@ -231,7 +232,7 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def load_google_sheet_workbook(spreadsheet_url: str) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
     workbook = pd.ExcelFile(build_workbook_export_url(spreadsheet_url), engine="openpyxl")
     year = pd.Timestamp.now().year
@@ -243,7 +244,9 @@ def load_google_sheet_workbook(spreadsheet_url: str) -> tuple[pd.DataFrame, list
         parsed_date = parse_sheet_date(sheet_name, default_year=year)
         if parsed_date is not None:
             sheet_dates.append(parsed_date)
-        sheet_df["date"] = parsed_date if parsed_date is not None else pd.Timestamp.now().normalize()
+            sheet_df["date"] = parsed_date
+        elif "Date" not in sheet_df.columns and "date" not in sheet_df.columns:
+            sheet_df["date"] = pd.NaT
         frames.append(sheet_df)
 
     if not frames:
@@ -258,6 +261,23 @@ def build_daily_summary(df: pd.DataFrame, sheet_dates: list[pd.Timestamp]) -> pd
         df.dropna(subset=["date"])
         .groupby("date", as_index=False)
         .agg(
+            group_count=("date", "size"),
+            walk_in_pax=(
+                "pax",
+                lambda values: int(
+                    pd.to_numeric(values[df.loc[values.index, "guest_type"].astype(str).str.strip().eq("Walk in")], errors="coerce")
+                    .fillna(0)
+                    .sum()
+                ),
+            ),
+            in_house_pax=(
+                "pax",
+                lambda values: int(
+                    pd.to_numeric(values[df.loc[values.index, "guest_type"].astype(str).str.strip().eq("In house")], errors="coerce")
+                    .fillna(0)
+                    .sum()
+                ),
+            ),
             waited_groups=("queue_wait_minutes", lambda values: int((values > 0).sum())),
             avg_wait_minutes=(
                 "queue_wait_minutes",
@@ -269,18 +289,32 @@ def build_daily_summary(df: pd.DataFrame, sheet_dates: list[pd.Timestamp]) -> pd
         .sort_values("date")
     )
 
+    observed_dates = grouped["date"].dropna().dt.normalize().drop_duplicates().sort_values()
+
     if sheet_dates:
         normalized_sheet_dates = pd.to_datetime(pd.Series(sheet_dates)).dt.normalize().dropna().drop_duplicates().sort_values()
-        full_dates = pd.DataFrame({"date": pd.date_range(normalized_sheet_dates.min(), normalized_sheet_dates.max(), freq="D")})
+        all_known_dates = pd.concat([observed_dates, normalized_sheet_dates]).dropna().drop_duplicates().sort_values()
+        full_dates = pd.DataFrame({"date": pd.date_range(all_known_dates.min(), all_known_dates.max(), freq="D")})
         daily = full_dates.merge(grouped, on="date", how="left")
-        daily["has_sheet_data"] = daily["date"].isin(set(normalized_sheet_dates.tolist()))
+        daily["has_sheet_data"] = daily["date"].isin(set(observed_dates.tolist()))
     else:
         daily = grouped.copy()
-        daily["has_sheet_data"] = True
+        daily["has_sheet_data"] = daily["date"].isin(set(observed_dates.tolist()))
 
-    for column in ["waited_groups", "avg_wait_minutes", "walk_aways", "guest_count"]:
+    for column in [
+        "group_count",
+        "walk_in_pax",
+        "in_house_pax",
+        "waited_groups",
+        "avg_wait_minutes",
+        "walk_aways",
+        "guest_count",
+    ]:
         daily[column] = daily[column].fillna(0)
 
+    daily["group_count"] = daily["group_count"].astype(int)
+    daily["walk_in_pax"] = daily["walk_in_pax"].astype(int)
+    daily["in_house_pax"] = daily["in_house_pax"].astype(int)
     daily["waited_groups"] = daily["waited_groups"].astype(int)
     daily["walk_aways"] = daily["walk_aways"].astype(int)
     daily["guest_count"] = daily["guest_count"].astype(int)
@@ -317,9 +351,17 @@ def build_daily_summary(df: pd.DataFrame, sheet_dates: list[pd.Timestamp]) -> pd
         peak_queue_times.append("" if peak_time is None or max_queues == 0 else peak_time.strftime("%H:%M"))
 
     daily["peak_queue_time"] = peak_queue_times
-    daily["date_label"] = daily["date"].dt.strftime("%Y-%m-%d")
+    daily["date_label"] = daily["date"].dt.strftime("%Y-%m-%d (%A)")
+    daily["day_type"] = daily["date"].dt.dayofweek.map(lambda value: "Weekend" if value >= 5 else "Weekday")
     daily["walkaway_delta"] = daily["walk_aways"].diff().fillna(daily["walk_aways"]).astype(int)
     return daily
+
+
+def format_metric_delta(value: float, *, comparison_label: str, suffix: str = "", decimals: int = 0) -> str:
+    formatted_value = f"{value:+.{decimals}f}"
+    if decimals == 0:
+        formatted_value = f"{int(round(value)):+d}"
+    return f"{formatted_value}{suffix} vs {comparison_label}"
 
 
 def build_wait_walkaway_chart(daily: pd.DataFrame) -> go.Figure:
@@ -760,12 +802,38 @@ def main() -> None:
     overview_tab, daily_tab = st.tabs(["Overview", "Daily Analytics"])
 
     with overview_tab:
-        render_plotly_chart(build_queue_with_walkaway_area_chart(daily))
-        render_plotly_chart(build_guest_count_and_queue_chart(daily))
+        overview_min_date = daily["date"].min().date()
+        overview_max_date = daily["date"].max().date()
+        date_filter_left, date_filter_right = st.columns(2)
+        overview_start_date = date_filter_left.date_input(
+            "Start date",
+            value=overview_min_date,
+            min_value=overview_min_date,
+            max_value=overview_max_date,
+            key="overview_start_date",
+        )
+        overview_end_date = date_filter_right.date_input(
+            "End date",
+            value=overview_max_date,
+            min_value=overview_min_date,
+            max_value=overview_max_date,
+            key="overview_end_date",
+        )
+
+        if overview_start_date > overview_end_date:
+            st.warning("Start date must be on or before end date.")
+            st.stop()
+
+        filtered_daily = daily[
+            daily["date"].between(pd.Timestamp(overview_start_date), pd.Timestamp(overview_end_date))
+        ].copy()
+
+        render_plotly_chart(build_queue_with_walkaway_area_chart(filtered_daily))
+        render_plotly_chart(build_guest_count_and_queue_chart(filtered_daily))
         st.markdown("*WA = walk away | Time on bar is peak of queue waiting*")
 
-        peak_wait_row = daily.loc[daily["avg_wait_minutes"].idxmax()]
-        peak_walkaway_row = daily.loc[daily["walk_aways"].idxmax()]
+        peak_wait_row = filtered_daily.loc[filtered_daily["avg_wait_minutes"].idxmax()]
+        peak_walkaway_row = filtered_daily.loc[filtered_daily["walk_aways"].idxmax()]
         metric_left, metric_right = st.columns(2)
         metric_left.metric(
             "Highest average wait",
@@ -780,9 +848,21 @@ def main() -> None:
 
         with st.expander("Daily summary data"):
             st.dataframe(
-                daily[["date_label", "guest_count", "waited_groups", "avg_wait_minutes", "walk_aways"]],
+                filtered_daily[["date_label", "guest_count", "waited_groups", "avg_wait_minutes", "walk_aways"]],
                 use_container_width=True,
             )
+            unique_sheet_dates = (
+                pd.to_datetime(pd.Series(sheet_dates)).dt.normalize().dropna().drop_duplicates().sort_values()
+            )
+            if not unique_sheet_dates.empty:
+                st.caption(
+                    "Google Sheets dates pulled: "
+                    f"{len(unique_sheet_dates)} "
+                    f"({unique_sheet_dates.min().strftime('%Y-%m-%d')} to "
+                    f"{unique_sheet_dates.max().strftime('%Y-%m-%d')})"
+                )
+            else:
+                st.caption("Google Sheets dates pulled: 0")
 
     with daily_tab:
         available_dates = sorted(df["date"].dropna().dt.normalize().unique())
@@ -793,9 +873,213 @@ def main() -> None:
         selected_date = st.selectbox(
             "Choose a day",
             options=available_dates,
+            index=len(available_dates) - 1,
             format_func=lambda value: pd.Timestamp(value).strftime("%Y-%m-%d"),
         )
         day_df = df[df["date"] == pd.Timestamp(selected_date).normalize()].copy()
+        selected_day = pd.Timestamp(selected_date).normalize()
+        selected_day_summary = daily.loc[daily["date"] == selected_day].iloc[0]
+        comparison_daily = daily[daily["has_sheet_data"] & (daily["day_type"] == selected_day_summary["day_type"])].copy()
+
+        average_group_count = comparison_daily["group_count"].mean() if not comparison_daily.empty else 0.0
+        average_guest_count = comparison_daily["guest_count"].mean() if not comparison_daily.empty else 0.0
+        average_walk_in_pax = comparison_daily["walk_in_pax"].mean() if not comparison_daily.empty else 0.0
+        average_in_house_pax = comparison_daily["in_house_pax"].mean() if not comparison_daily.empty else 0.0
+        comparison_day_df = df[df["date"].isin(comparison_daily["date"])].copy()
+        comparison_waits = pd.to_numeric(comparison_day_df["queue_wait_minutes"], errors="coerce")
+        positive_comparison_waits = comparison_waits[comparison_waits > 0]
+        comparison_longest_wait_minutes = float(positive_comparison_waits.max()) if not positive_comparison_waits.empty else 0.0
+        comparison_average_wait_minutes = float(positive_comparison_waits.mean()) if not positive_comparison_waits.empty else 0.0
+        comparison_median_wait_minutes = float(positive_comparison_waits.median()) if not positive_comparison_waits.empty else 0.0
+        comparison_walk_aways = comparison_daily["walk_aways"].mean() if not comparison_daily.empty else 0.0
+        comparison_max_queue_groups: list[int] = []
+        comparison_queue_appearance_hours: list[float] = []
+        for comparison_date in comparison_daily["date"]:
+            comparison_queues = comparison_day_df[
+                (comparison_day_df["date"] == comparison_date)
+                & comparison_day_df["queue_start"].notna()
+                & comparison_day_df["queue_end"].notna()
+                & (comparison_day_df["queue_end"] >= comparison_day_df["queue_start"])
+            ][["queue_start", "queue_end"]]
+            comparison_longest_queue_group_count = 0
+            comparison_queue_duration_minutes = 0.0
+            if not comparison_queues.empty:
+                comparison_queue_events: list[tuple[pd.Timestamp, int]] = []
+                for queue_start, queue_end in comparison_queues.itertuples(index=False):
+                    comparison_queue_events.append((queue_start, 1))
+                    comparison_queue_events.append((queue_end, -1))
+
+                comparison_queue_events.sort(key=lambda event: (event[0], -event[1]))
+                comparison_active_queue_groups = 0
+                comparison_current_queue_start: pd.Timestamp | None = None
+                for event_time, delta in comparison_queue_events:
+                    previous_active_queue_groups = comparison_active_queue_groups
+                    comparison_active_queue_groups += delta
+                    if previous_active_queue_groups == 0 and comparison_active_queue_groups > 0:
+                        comparison_current_queue_start = event_time
+                    elif (
+                        previous_active_queue_groups > 0
+                        and comparison_active_queue_groups == 0
+                        and comparison_current_queue_start is not None
+                    ):
+                        comparison_queue_duration_minutes += (
+                            event_time - comparison_current_queue_start
+                        ).total_seconds() / 60
+                        comparison_current_queue_start = None
+                    comparison_longest_queue_group_count = max(
+                        comparison_longest_queue_group_count,
+                        comparison_active_queue_groups,
+                    )
+
+            comparison_max_queue_groups.append(comparison_longest_queue_group_count)
+            comparison_queue_appearance_hours.append(comparison_queue_duration_minutes / 60)
+
+        comparison_max_queue_group_count = (
+            sum(comparison_max_queue_groups) / len(comparison_max_queue_groups)
+            if comparison_max_queue_groups
+            else 0.0
+        )
+        comparison_queue_appearance_hours_value = (
+            sum(comparison_queue_appearance_hours) / len(comparison_queue_appearance_hours)
+            if comparison_queue_appearance_hours
+            else 0.0
+        )
+        waited_values = pd.to_numeric(day_df["queue_wait_minutes"], errors="coerce")
+        positive_waited_values = waited_values[waited_values > 0]
+        longest_wait_minutes = float(positive_waited_values.max()) if not positive_waited_values.empty else 0.0
+        average_wait_minutes = float(positive_waited_values.mean()) if not positive_waited_values.empty else 0.0
+        median_wait_minutes = float(positive_waited_values.median()) if not positive_waited_values.empty else 0.0
+        day_queues = day_df[
+            day_df["queue_start"].notna()
+            & day_df["queue_end"].notna()
+            & (day_df["queue_end"] >= day_df["queue_start"])
+        ][["queue_start", "queue_end"]]
+        longest_queue_group_count = 0
+        queue_duration_minutes = 0.0
+        if not day_queues.empty:
+            queue_events: list[tuple[pd.Timestamp, int]] = []
+            for queue_start, queue_end in day_queues.itertuples(index=False):
+                queue_events.append((queue_start, 1))
+                queue_events.append((queue_end, -1))
+
+            queue_events.sort(key=lambda event: (event[0], -event[1]))
+            active_queue_groups = 0
+            current_queue_start: pd.Timestamp | None = None
+            for _, delta in queue_events:
+                previous_active_queue_groups = active_queue_groups
+                active_queue_groups += delta
+                event_time = _
+                if previous_active_queue_groups == 0 and active_queue_groups > 0:
+                    current_queue_start = event_time
+                elif previous_active_queue_groups > 0 and active_queue_groups == 0 and current_queue_start is not None:
+                    queue_duration_minutes += (event_time - current_queue_start).total_seconds() / 60
+                    current_queue_start = None
+                longest_queue_group_count = max(longest_queue_group_count, active_queue_groups)
+        queue_hours = queue_duration_minutes / 60
+        if pd.isna(longest_wait_minutes):
+            longest_wait_minutes = 0.0
+        if pd.isna(average_wait_minutes):
+            average_wait_minutes = 0.0
+        if pd.isna(median_wait_minutes):
+            median_wait_minutes = 0.0
+
+        st.caption(f"{selected_day_summary['date_label']} metrics.")
+        st.markdown(
+            f"Comparison deltas are versus the average <u><strong>{str(selected_day_summary['day_type']).lower()}</strong></u>.",
+            unsafe_allow_html=True,
+        )
+        comparison_label = str(selected_day_summary["day_type"]).lower()
+
+        top_metric_group, top_metric_pax, top_metric_walk_in, top_metric_in_house = st.columns(4)
+        top_metric_group.metric(
+            "Groups",
+            int(selected_day_summary["group_count"]),
+            format_metric_delta(
+                selected_day_summary["group_count"] - average_group_count,
+                comparison_label=comparison_label,
+            ),
+        )
+        top_metric_pax.metric(
+            "Pax",
+            int(selected_day_summary["guest_count"]),
+            format_metric_delta(
+                selected_day_summary["guest_count"] - average_guest_count,
+                comparison_label=comparison_label,
+            ),
+        )
+        top_metric_walk_in.metric(
+            "Walk in (pax)",
+            int(selected_day_summary["walk_in_pax"]),
+            format_metric_delta(
+                selected_day_summary["walk_in_pax"] - average_walk_in_pax,
+                comparison_label=comparison_label,
+            ),
+        )
+        top_metric_in_house.metric(
+            "In house (pax)",
+            int(selected_day_summary["in_house_pax"]),
+            format_metric_delta(
+                selected_day_summary["in_house_pax"] - average_in_house_pax,
+                comparison_label=comparison_label,
+            ),
+        )
+
+        bottom_metric_longest_wait, bottom_metric_average_wait, bottom_metric_median_wait, bottom_metric_spacer = st.columns(4)
+        bottom_metric_longest_wait.metric(
+            "Longest wait (min)",
+            f"{longest_wait_minutes:.0f} min",
+            format_metric_delta(
+                longest_wait_minutes - comparison_longest_wait_minutes,
+                comparison_label=comparison_label,
+                decimals=1,
+            ),
+        )
+        bottom_metric_average_wait.metric(
+            "Average wait (min)",
+            f"{average_wait_minutes:.1f} min",
+            format_metric_delta(
+                average_wait_minutes - comparison_average_wait_minutes,
+                comparison_label=comparison_label,
+                decimals=1,
+            ),
+        )
+        bottom_metric_median_wait.metric(
+            "Median wait (min)",
+            f"{median_wait_minutes:.1f} min",
+            format_metric_delta(
+                median_wait_minutes - comparison_median_wait_minutes,
+                comparison_label=comparison_label,
+                decimals=1,
+            ),
+        )
+
+        third_row_walkaway, third_row_queue, third_row_queue_hours, third_row_spacer = st.columns(4)
+        third_row_walkaway.metric(
+            "Walk-aways",
+            int(selected_day_summary["walk_aways"]),
+            format_metric_delta(
+                selected_day_summary["walk_aways"] - comparison_walk_aways,
+                comparison_label=comparison_label,
+            ),
+        )
+        third_row_queue.metric(
+            "Max queue (groups)",
+            int(longest_queue_group_count),
+            format_metric_delta(
+                longest_queue_group_count - comparison_max_queue_group_count,
+                comparison_label=comparison_label,
+                decimals=1,
+            ),
+        )
+        third_row_queue_hours.metric(
+            "Queue appearance",
+            f"{queue_hours:.1f} h",
+            format_metric_delta(
+                queue_hours - comparison_queue_appearance_hours_value,
+                comparison_label=comparison_label,
+                decimals=1,
+            ),
+        )
 
         gantt_chart = build_daily_seating_gantt(day_df)
         if gantt_chart.data:
