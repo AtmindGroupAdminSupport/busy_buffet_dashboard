@@ -196,9 +196,16 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["date"] = pd.NaT
 
+    if "service_no" in df.columns:
+        df["service_no"] = df["service_no"].astype(str).str.strip()
+        df.loc[df["service_no"].str.lower().isin({"nan", "nat"}), "service_no"] = ""
+    else:
+        df["service_no"] = ""
+
     for column in ["table_no", "guest_type"]:
         if column in df.columns:
             df[column] = df[column].astype(str).str.strip()
+            df.loc[df[column].str.lower().isin({"nan", "nat"}), column] = ""
 
     if "pax" in df.columns:
         df["pax"] = pd.to_numeric(df["pax"], errors="coerce").fillna(0)
@@ -248,6 +255,21 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["walk_away"] = has_queue & ~has_meal
     df["meal_duration_minutes"] = (df["meal_end"] - df["meal_start"]).dt.total_seconds() / 60
+
+    service_is_numeric = pd.to_numeric(df["service_no"], errors="coerce").notna()
+    footer_labels = {"total", "subtotal", "grand total"}
+    footer_label_mask = df["service_no"].str.lower().isin(footer_labels)
+    has_operational_data = (
+        df["pax"].ne(0)
+        | df["table_no"].ne("")
+        | df["guest_type"].ne("")
+        | df["queue_start"].notna()
+        | df["queue_end"].notna()
+        | df["meal_start"].notna()
+        | df["meal_end"].notna()
+    )
+    non_service_summary_mask = ~service_is_numeric & (footer_label_mask | ~has_operational_data)
+    df = df.loc[~non_service_summary_mask].copy()
 
     return df
 
