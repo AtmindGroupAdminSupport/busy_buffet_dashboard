@@ -651,6 +651,16 @@ def build_guest_count_and_queue_chart(daily: pd.DataFrame) -> go.Figure:
             "<br>In house (pax): %{customdata[1]}<extra></extra>"
         ),
     )
+    fig.add_scatter(
+        x=daily["date_label"],
+        y=daily["guest_count"],
+        text=daily["guest_count"].astype(int).astype(str),
+        mode="text",
+        textposition="top center",
+        textfont=dict(color=PALETTE["berry"], size=11),
+        hoverinfo="skip",
+        showlegend=False,
+    )
     fig.update_layout(
         title="Guest pax split and number of queues by date",
         xaxis=build_date_axis(daily),
@@ -669,6 +679,7 @@ def build_guest_count_and_queue_chart(daily: pd.DataFrame) -> go.Figure:
         hovermode="x unified",
         template="plotly_white",
     )
+    fig.update_traces(cliponaxis=False, selector=dict(type="bar"))
     return fig
 
 
@@ -1046,10 +1057,14 @@ def main() -> None:
     with overview_tab:
         overview_min_date = daily["date"].min().date()
         overview_max_date = daily["date"].max().date()
+        overview_default_start_date = max(
+            overview_min_date,
+            overview_max_date - datetime.timedelta(days=29),
+        )
         date_filter_left, date_filter_right = st.columns(2)
         overview_start_date = date_filter_left.date_input(
             "Start date",
-            value=overview_min_date,
+            value=overview_default_start_date,
             min_value=overview_min_date,
             max_value=overview_max_date,
             key="overview_start_date",
